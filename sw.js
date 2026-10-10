@@ -1,11 +1,14 @@
 /**
- * Focus Session - Offline Service Worker
- * Pre-caches shell assets and serves requests via stale-while-revalidate strategy.
+ * Rally - Offline service worker.
+ *
+ * Network-first for the app's own files: you always get the latest deploy when online,
+ * and a matching cached copy when offline. (Cache-first would mix old and new files
+ * after a GitHub Pages deploy.) Bump CACHE_VERSION when the precache list changes.
  */
 
-const CACHE_NAME = 'focus-session-v2.0.0';
+const CACHE_VERSION = 'rally-v3';
 
-const PRECACHE_ASSETS = [
+const PRECACHE = [
   './',
   './index.html',
   './manifest.webmanifest',
@@ -13,70 +16,60 @@ const PRECACHE_ASSETS = [
   './css/base.css',
   './css/components.css',
   './js/app.js',
-  './js/state.js',
-  './js/worker.js',
   './js/audio.js',
+  './js/config.js',
+  './js/dom.js',
   './js/favicon.js',
+  './js/peer-sync.js',
+  './js/peers-view.js',
+  './js/quest-view.js',
+  './js/state.js',
+  './js/timer.js',
+  './js/toast.js',
   './js/ui.js',
-  './icons/favicon.svg'
+  './js/worker.js',
+  './vendor/peerjs.min.js',
+  './icons/favicon.svg',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
+  './icons/maskable-512.png',
+  './icons/apple-touch-icon.png',
 ];
 
-/**
- * Installation: Cache core application assets
- */
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches
-      .open(CACHE_NAME)
-      .then((cache) => cache.addAll(PRECACHE_ASSETS))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_VERSION)
+      .then((cache) => cache.addAll(PRECACHE))
+      .then(() => self.skipWaiting()),
   );
 });
 
-/**
- * Activation: Purge superseded cache versions
- */
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches
-      .keys()
-      .then((cacheNames) => {
-        return Promise.all(
-          cacheNames
-            .filter((name) => name !== CACHE_NAME)
-            .map((name) => caches.delete(name))
-        );
-      })
-      .then(() => self.clients.claim())
+    caches.keys()
+      .then((names) => Promise.all(names.filter((n) => n !== CACHE_VERSION).map((n) => caches.delete(n))))
+      .then(() => self.clients.claim()),
   );
 });
 
-/**
- * Fetch interception: Stale-while-revalidate strategy
- */
 self.addEventListener('fetch', (event) => {
-  // Only intercept same-origin HTTP/HTTPS GET requests
-  if (event.request.method !== 'GET' || !event.request.url.startsWith(self.location.origin)) {
-    return;
-  }
+  const { request } = event;
+  if (request.method !== 'GET' || new URL(request.url).origin !== self.location.origin) return;
 
-  event.respondWith(
-    caches.open(CACHE_NAME).then(async (cache) => {
-      const cachedResponse = await cache.match(event.request);
-
-      const fetchPromise = fetch(event.request)
-        .then((networkResponse) => {
-          if (networkResponse && networkResponse.status === 200) {
-            cache.put(event.request, networkResponse.clone());
-          }
-          return networkResponse;
-        })
-        .catch(() => {
-          // Offline fallback; cachedResponse handles this if available
-          return cachedResponse;
-        });
-
-      return cachedResponse || fetchPromise;
-    })
-  );
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE_VERSION);
+    try {
+      const response = await fetch(request, { cache: 'no-cache' });
+      if (response.ok) cache.put(request, response.clone());
+      return response;
+    } catch (err) {
+      const cached = await cache.match(request, { ignoreSearch: true });
+      if (cached) return cached;
+      if (request.mode === 'navigate') {
+        const shell = await cache.match('./index.html');
+        if (shell) return shell;
+      }
+      throw err;
+    }
+  })());
 });
