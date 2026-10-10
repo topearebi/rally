@@ -1,42 +1,18 @@
 /**
- * Rally - Precision Background Worker
- * Dedicated off-thread timer loop managing countdown and capped count-up sessions.
+ * Rally - Background ticker.
+ * Timers in a dedicated worker are throttled far less than main-thread timers when the
+ * tab is hidden, so phase changes (and their sounds) still fire on time. The worker only
+ * ticks; all timing maths uses wall-clock timestamps on the main thread.
  */
 
 let timerId = null;
 
 self.onmessage = (event) => {
-  const { command, remainingMs, targetTime, timerDirection, totalDurationMs } = event.data;
-
+  const { command, intervalMs = 250 } = event.data || {};
   if (command === 'START') {
     clearInterval(timerId);
-
-    timerId = setInterval(() => {
-      const now = Date.now();
-
-      if (timerDirection === 'countup') {
-        const elapsed = now - targetTime;
-
-        if (totalDurationMs && elapsed >= totalDurationMs) {
-          clearInterval(timerId);
-          self.postMessage({ type: 'TICK', remainingMs: totalDurationMs });
-          self.postMessage({ type: 'COMPLETE' });
-        } else {
-          self.postMessage({ type: 'TICK', remainingMs: Math.max(0, elapsed) });
-        }
-      } else {
-        const remaining = targetTime - now;
-
-        if (remaining <= 0) {
-          clearInterval(timerId);
-          self.postMessage({ type: 'TICK', remainingMs: 0 });
-          self.postMessage({ type: 'COMPLETE' });
-        } else {
-          self.postMessage({ type: 'TICK', remainingMs: Math.max(0, remaining) });
-        }
-      }
-    }, 250);
-  } else if (command === 'PAUSE') {
+    timerId = setInterval(() => self.postMessage({ type: 'TICK', now: Date.now() }), intervalMs);
+  } else if (command === 'STOP') {
     clearInterval(timerId);
     timerId = null;
   }

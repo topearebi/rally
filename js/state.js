@@ -1,105 +1,197 @@
 /**
- * Rally - Reactive State Store & Persistence
- * Supports task editing, reordering, sound profiles, interval timing, and peer presence.
+ * Rally - Reactive state store & persistence.
+ *
+ * Timing model: a phase is described by `durationMs`, `elapsedMs` and — while running —
+ * `anchorTs` (the wall-clock time at which elapsed was 0). Elapsed time is always derived
+ * from the clock, so the store does NOT change on every tick; only real events (start,
+ * pause, phase change, edits) notify subscribers. Countdown vs count-up is purely a
+ * display choice and can be switched at any time without corrupting progress.
  */
 
-const STORAGE_KEY = 'rally_state_v4';
+import { MODES, PEER_COLORS, LIMITS, SYNC } from './config.js';
 
-const DEFAULT_STATE = {
-  profile: {
-    displayName: 'Player 1',
-    avatarColor: '#38bdf8',
-  },
-  config: {
-    sprintDurationSeconds: 25 * 60, // 1500s (25m)
-    shortRestDurationSeconds: 5 * 60, // 300s (5m)
-    longRestDurationSeconds: 15 * 60, // 900s (15m)
-    roundsBeforeLongRest: 4,
-    totalRounds: 4, // 0 = infinite continuous
-    autoStartBreaks: true,
-    autoStartSprints: false,
-    timerDirection: 'countdown', // 'countdown' | 'countup'
-    soundEnabled: true,
-    soundProfile: 'warm', // 'warm' | 'crisp' | 'minimal'
-  },
-  session: {
-    mode: 'sprint', // 'sprint' | 'shortRest' | 'longRest'
-    status: 'idle', // 'idle' | 'running' | 'paused'
-    currentRound: 1,
-    remainingMs: 25 * 60 * 1000,
-    totalDurationMs: 25 * 60 * 1000,
-    targetTimestamp: null,
-  },
-  quest: {
-    title: '',
-    stones: [
-      { id: 'stone-1', text: 'Define the game plan', completed: false },
-      { id: 'stone-2', text: 'Execute step one', completed: false },
-    ],
-  },
-  room: {
-    roomId: null,
-    isHost: false,
-    connectionStatus: 'disconnected', // 'disconnected' | 'connecting' | 'connected'
-    syncTimers: false,
-    peers: {}, // peerId -> peerState
-  },
+const STORAGE_KEY = 'rally_state_v5';
+const LEGACY_KEY = 'rally_state_v4';
+
+const ADJECTIVES = ['Calm', 'Brave', 'Steady', 'Bright', 'Swift', 'Quiet', 'Bold', 'Keen'];
+const ANIMALS = ['Otter', 'Falcon', 'Fox', 'Panda', 'Heron', 'Lynx', 'Koala', 'Orca'];
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+const todayKey = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
+
+const makeId = (prefix = 'stone') => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+
+function createDefaultState() {
+  return {
+    profile: {
+      displayName: `${pick(ADJECTIVES)} ${pick(ANIMALS)}`,
+      avatarColor: pick(PEER_COLORS),
+    },
+    config: {
+      sprintDurationSeconds: 25 * 60,
+      shortRestDurationSeconds: 5 * 60,
+      longRestDurationSeconds: 15 * 60,
+      roundsBeforeLongRest: 4,
+      totalRounds: 4, // 0 = keep going forever
+      autoStartBreaks: true,
+      autoStartSprints: false,
+      timerDirection: 'countdown', // 'countdown' | 'countup' (display only)
+      soundEnabled: true,
+      soundProfile: 'warm', // 'warm' | 'crisp' | 'minimal'
+      notificationsEnabled: false,
+      focusView: false,
+    },
+    session: {
+      mode: 'sprint',
+      status: 'idle', // 'idle' | 'running' | 'paused' | 'complete'
+      currentRound: 1,
+      durationMs: 25 * 60 * 1000,
+      elapsedMs: 0,
+      anchorTs: null,
+    },
+    quest: {
+      title: '',
+      stones: [],
+    },
+    stats: { day: todayKey(), sprints: 0, focusMs: 0 },
+    room: {
+      roomId: null,
+      isHost: false,
+      connectionStatus: 'disconnected', // 'disconnected' | 'connecting' | 'connected'
+      error: null,
+      linkTimers: false, // host: everyone follows my timer
+      followHost: true, // guest: whether I follow a linking host
+      hostLinked: false, // guest: is the host currently linking timers
+      hostName: null,
+      peers: {},
+    },
+  };
+}
+
+/* ---------------------------- pure helpers ---------------------------- */
+
+export function getElapsedMs(session, now = Date.now()) {
+  if (session.status === 'running' && session.anchorTs != null) {
+    return Math.max(0, now - session.anchorTs);
+  }
+  return session.elapsedMs;
+}
+
+export function getRemainingMs(session, now = Date.now()) {
+  return Math.max(0, session.durationMs - getElapsedMs(session, now));
+}
+
+const clampInt = (v, min, max, fallback) => {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+};
+
+const cleanText = (v, max) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+function sanitizeStones(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((s) => s && typeof s.text === 'string' && s.text.trim())
+    .slice(0, LIMITS.maxStones)
+    .map((s) => ({
+      id: typeof s.id === 'string' ? s.id : makeId(),
+      text: cleanText(s.text, LIMITS.stoneLength),
+      completed: Boolean(s.completed),
+    }));
+}
+
+/** Converts a v4 save (remaining-based timing) into the v5 shape. */
+function migrateLegacy(parsed) {
+  const base = createDefaultState();
+  const cfg = { ...base.config, ...(parsed.config || {}) };
+  const s = parsed.session || {};
+  const durationMs = s.totalDurationMs || cfg.sprintDurationSeconds * 1000;
+  let elapsedMs = 0;
+  if (typeof s.remainingMs === 'number') {
+    elapsedMs = cfg.timerDirection === 'countup' ? s.remainingMs : durationMs - s.remainingMs;
+  }
+  if (s.status === 'running' && s.targetTimestamp) {
+    elapsedMs = cfg.timerDirection === 'countup'
+      ? Date.now() - s.targetTimestamp
+      : durationMs - (s.targetTimestamp - Date.now());
+  }
+  elapsedMs = Math.min(durationMs, Math.max(0, elapsedMs));
+  return {
+    profile: { ...parsed.profile },
+    config: cfg,
+    session: {
+      mode: MODES.includes(s.mode) ? s.mode : 'sprint',
+      status: elapsedMs > 0 && elapsedMs < durationMs ? 'paused' : 'idle',
+      currentRound: s.currentRound || 1,
+      durationMs,
+      elapsedMs: elapsedMs >= durationMs ? 0 : elapsedMs,
+      anchorTs: null,
+    },
+    quest: parsed.quest,
+  };
+}
+
+/* ------------------------------- store -------------------------------- */
 
 class StateStore {
   constructor() {
     this.subscribers = new Set();
     this.state = this.loadState();
+    this.snapshot = null;
   }
 
   loadState() {
+    const base = createDefaultState();
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return structuredClone(DEFAULT_STATE);
+      let raw = localStorage.getItem(STORAGE_KEY);
+      let parsed = raw ? JSON.parse(raw) : null;
+      if (!parsed) {
+        const legacy = localStorage.getItem(LEGACY_KEY);
+        if (legacy) parsed = migrateLegacy(JSON.parse(legacy));
+      }
+      if (!parsed) return base;
 
-      const parsed = JSON.parse(raw);
-      const state = {
-        profile: { ...DEFAULT_STATE.profile, ...parsed.profile },
-        config: { ...DEFAULT_STATE.config, ...parsed.config },
-        session: { ...DEFAULT_STATE.session, ...parsed.session },
-        quest: { ...DEFAULT_STATE.quest, ...parsed.quest },
-        room: structuredClone(DEFAULT_STATE.room),
-      };
-
-      if (state.session.status === 'running' && state.session.targetTimestamp) {
-        if (state.config.timerDirection === 'countdown') {
-          const remaining = state.session.targetTimestamp - Date.now();
-          if (remaining > 0) {
-            state.session.remainingMs = remaining;
-          } else {
-            state.session.remainingMs = 0;
-            state.session.status = 'idle';
-            state.session.targetTimestamp = null;
-          }
-        } else {
-          const elapsed = Date.now() - state.session.targetTimestamp;
-          state.session.remainingMs = Math.max(0, elapsed);
-        }
+      const profile = { ...base.profile, ...parsed.profile };
+      // Old saves defaulted everyone to the same name/colour; give them a distinct colour.
+      if (!PEER_COLORS.includes(profile.avatarColor) || (profile.avatarColor === '#38bdf8' && !parsed.stats)) {
+        profile.avatarColor = base.profile.avatarColor;
+      }
+      if (!profile.displayName || profile.displayName === 'Player 1') {
+        profile.displayName = base.profile.displayName;
       }
 
-      return state;
+      const session = { ...base.session, ...parsed.session };
+      if (!MODES.includes(session.mode)) session.mode = 'sprint';
+      if (session.status === 'running' && session.anchorTs == null) session.status = 'paused';
+
+      const stats = parsed.stats && parsed.stats.day === todayKey() ? { ...base.stats, ...parsed.stats } : base.stats;
+
+      return {
+        profile,
+        config: { ...base.config, ...parsed.config },
+        session,
+        quest: {
+          title: cleanText(parsed.quest?.title, LIMITS.questLength),
+          stones: sanitizeStones(parsed.quest?.stones),
+        },
+        stats,
+        room: base.room,
+      };
     } catch (e) {
-      console.warn('Failed to parse local state, falling back to defaults:', e);
-      return structuredClone(DEFAULT_STATE);
+      console.warn('[Rally] Could not read saved state, starting fresh:', e);
+      return base;
     }
   }
 
   persistState() {
     try {
-      const toPersist = {
-        profile: this.state.profile,
-        config: this.state.config,
-        session: this.state.session,
-        quest: this.state.quest,
-      };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersist));
+      const { profile, config, session, quest, stats } = this.state;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ profile, config, session, quest, stats }));
     } catch (e) {
-      console.error('Failed to commit state to localStorage:', e);
+      // Private mode / quota — the app still works for this visit.
     }
   }
 
@@ -109,227 +201,305 @@ class StateStore {
     return () => this.subscribers.delete(callback);
   }
 
-  notify() {
-    this.persistState();
+  notify({ persist = true } = {}) {
+    if (persist) this.persistState();
+    this.snapshot = null;
     const snapshot = this.getState();
-    for (const callback of this.subscribers) {
-      callback(snapshot);
-    }
+    for (const cb of this.subscribers) cb(snapshot);
   }
 
+  /** Returns a frozen-by-convention deep copy; cached until the next change. */
   getState() {
-    return structuredClone(this.state);
+    if (!this.snapshot) this.snapshot = structuredClone(this.state);
+    return this.snapshot;
   }
 
-  /* ================= Profile & Preferences ================= */
-  updateProfile(displayName, avatarColor) {
-    if (displayName) this.state.profile.displayName = displayName.trim();
-    if (avatarColor) this.state.profile.avatarColor = avatarColor;
+  /* ========================= Profile & Preferences ========================= */
+
+  updateProfile({ displayName, avatarColor } = {}) {
+    const name = cleanText(displayName, LIMITS.nameLength);
+    if (name) this.state.profile.displayName = name;
+    if (avatarColor && PEER_COLORS.includes(avatarColor)) this.state.profile.avatarColor = avatarColor;
     this.notify();
   }
 
-  updateConfig(partialConfig) {
-    this.state.config = { ...this.state.config, ...partialConfig };
+  getDurationForMode(mode, config = this.state.config) {
+    const seconds = {
+      sprint: config.sprintDurationSeconds,
+      shortRest: config.shortRestDurationSeconds,
+      longRest: config.longRestDurationSeconds,
+    }[mode] ?? config.sprintDurationSeconds;
+    return Math.max(1, Math.round(seconds)) * 1000;
+  }
 
-    if (this.state.session.status === 'idle') {
-      const ms = this.getDurationForMode(this.state.session.mode);
-      this.state.session.totalDurationMs = ms;
-      this.state.session.remainingMs = this.state.config.timerDirection === 'countup' ? 0 : ms;
+  updateConfig(partial) {
+    const c = { ...this.state.config, ...partial };
+    c.sprintDurationSeconds = clampInt(c.sprintDurationSeconds, 1, 180 * 60, 1500);
+    c.shortRestDurationSeconds = clampInt(c.shortRestDurationSeconds, 1, 60 * 60, 300);
+    c.longRestDurationSeconds = clampInt(c.longRestDurationSeconds, 1, 120 * 60, 900);
+    c.roundsBeforeLongRest = clampInt(c.roundsBeforeLongRest, 1, 16, 4);
+    c.totalRounds = clampInt(c.totalRounds, 0, 32, 4);
+    if (!['countdown', 'countup'].includes(c.timerDirection)) c.timerDirection = 'countdown';
+    if (!['warm', 'crisp', 'minimal'].includes(c.soundProfile)) c.soundProfile = 'warm';
+    this.state.config = c;
+
+    // New durations apply immediately unless a phase is actively running
+    // (or we are following a host, who owns the durations).
+    const s = this.state.session;
+    if (s.status !== 'running' && !this.isFollowing()) {
+      s.durationMs = this.getDurationForMode(s.mode);
+      if (s.elapsedMs >= s.durationMs) {
+        s.elapsedMs = 0;
+        if (s.status === 'paused') s.status = 'idle';
+      }
     }
     this.notify();
   }
 
-  getDurationForMode(mode) {
-    switch (mode) {
-      case 'shortRest':
-        return Math.max(1, Math.round(this.state.config.shortRestDurationSeconds)) * 1000;
-      case 'longRest':
-        return Math.max(1, Math.round(this.state.config.longRestDurationSeconds)) * 1000;
-      case 'sprint':
-      default:
-        return Math.max(1, Math.round(this.state.config.sprintDurationSeconds)) * 1000;
-    }
-  }
+  /* ======================== Current Quest & Stones ======================== */
 
-  /* ================= Current Quest & Stepping Stones ================= */
   setQuestTitle(title) {
-    this.state.quest.title = title;
+    this.state.quest.title = cleanText(title, LIMITS.questLength);
     this.notify();
   }
 
   addSteppingStone(text) {
-    if (!text || !text.trim()) return;
-    const newStone = {
-      id: `stone-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      text: text.trim(),
-      completed: false,
-    };
-    this.state.quest.stones.push(newStone);
+    const clean = cleanText(text, LIMITS.stoneLength);
+    if (!clean || this.state.quest.stones.length >= LIMITS.maxStones) return null;
+    const stone = { id: makeId(), text: clean, completed: false };
+    this.state.quest.stones.push(stone);
     this.notify();
+    return stone;
   }
 
-  updateSteppingStone(id, newText) {
+  updateSteppingStone(id, text) {
     const stone = this.state.quest.stones.find((s) => s.id === id);
-    if (stone && newText && newText.trim()) {
-      stone.text = newText.trim();
+    const clean = cleanText(text, LIMITS.stoneLength);
+    if (stone && clean && clean !== stone.text) {
+      stone.text = clean;
       this.notify();
     }
   }
 
+  /** Moves a pending stone up/down among the *pending* stones only. */
   moveSteppingStone(id, direction) {
-    const index = this.state.quest.stones.findIndex((s) => s.id === id);
+    const stones = this.state.quest.stones;
+    const index = stones.findIndex((s) => s.id === id);
     if (index === -1) return;
-
-    const targetIndex = direction === 'up' ? index - 1 : index + 1;
-    if (targetIndex < 0 || targetIndex >= this.state.quest.stones.length) return;
-
-    const stones = [...this.state.quest.stones];
-    const [movedStone] = stones.splice(index, 1);
-    stones.splice(targetIndex, 0, movedStone);
-
-    this.state.quest.stones = stones;
+    const step = direction === 'up' ? -1 : 1;
+    let target = index + step;
+    while (target >= 0 && target < stones.length && stones[target].completed) target += step;
+    if (target < 0 || target >= stones.length) return;
+    [stones[index], stones[target]] = [stones[target], stones[index]];
     this.notify();
   }
 
   toggleSteppingStone(id) {
     const stone = this.state.quest.stones.find((s) => s.id === id);
-    if (stone) {
-      stone.completed = !stone.completed;
-      this.notify();
-    }
+    if (!stone) return false;
+    stone.completed = !stone.completed;
+    this.notify();
+    return stone.completed;
   }
 
   deleteSteppingStone(id) {
-    this.state.quest.stones = this.state.quest.stones.filter((s) => s.id !== id);
+    const stones = this.state.quest.stones;
+    const index = stones.findIndex((s) => s.id === id);
+    if (index === -1) return null;
+    const [removed] = stones.splice(index, 1);
+    this.notify();
+    return { stone: removed, index };
+  }
+
+  clearCompletedStones() {
+    const before = this.state.quest.stones;
+    this.state.quest.stones = before.filter((s) => !s.completed);
+    this.notify();
+    return before.length - this.state.quest.stones.length;
+  }
+
+  /** Replaces the whole quest (used for undo). */
+  restoreQuest(quest) {
+    this.state.quest = { title: cleanText(quest.title, LIMITS.questLength), stones: sanitizeStones(quest.stones) };
     this.notify();
   }
 
-  importSteppingStones(stones, newQuestTitle = null) {
-    if (!Array.isArray(stones) || stones.length === 0) return;
-
-    if (newQuestTitle && !this.state.quest.title) {
-      this.state.quest.title = newQuestTitle;
-    }
-
-    const imported = stones.map((s, index) => ({
-      id: `stone-import-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 5)}`,
-      text: s.text,
-      completed: false,
-    }));
-
-    this.state.quest.stones = imported;
-    this.notify();
-  }
-
-  /* ================= Timer Session & Rounds Engine ================= */
-  setMode(mode, roundOverride = null) {
-    if (!['sprint', 'shortRest', 'longRest'].includes(mode)) return;
-
-    const ms = this.getDurationForMode(mode);
-    this.state.session.mode = mode;
-    this.state.session.status = 'idle';
-    this.state.session.totalDurationMs = ms;
-    this.state.session.remainingMs = this.state.config.timerDirection === 'countup' ? 0 : ms;
-    this.state.session.targetTimestamp = null;
-
-    if (roundOverride !== null) {
-      this.state.session.currentRound = roundOverride;
-    }
-
-    this.notify();
-  }
-
-  updateRemaining(remainingMs) {
-    this.state.session.remainingMs = remainingMs;
-    this.notify();
-  }
-
-  startTimer() {
-    this.state.session.status = 'running';
-    if (this.state.config.timerDirection === 'countdown') {
-      this.state.session.targetTimestamp = Date.now() + this.state.session.remainingMs;
-    } else {
-      this.state.session.targetTimestamp = Date.now() - this.state.session.remainingMs;
-    }
-    this.notify();
-  }
-
-  pauseTimer() {
-    this.state.session.status = 'paused';
-    this.state.session.targetTimestamp = null;
-    this.notify();
-  }
-
-  resetTimer() {
-    this.setMode('sprint', 1);
-  }
-
-  advanceSession() {
-    const current = this.state.session.mode;
-    const round = this.state.session.currentRound;
-    const { roundsBeforeLongRest, autoStartBreaks, autoStartSprints } = this.state.config;
-
-    let nextMode = 'sprint';
-    let nextRound = round;
-    let shouldAutoStart = false;
-
-    if (current === 'sprint') {
-      if (roundsBeforeLongRest > 0 && round % roundsBeforeLongRest === 0) {
-        nextMode = 'longRest';
-      } else {
-        nextMode = 'shortRest';
-      }
-      shouldAutoStart = autoStartBreaks;
-    } else {
-      nextMode = 'sprint';
-      nextRound = round + 1;
-      shouldAutoStart = autoStartSprints;
-    }
-
-    this.setMode(nextMode, nextRound);
-
-    if (shouldAutoStart) {
-      this.startTimer();
-    }
-
-    return { nextMode, nextRound, shouldAutoStart };
-  }
-
-  /* ================= Shared Squad Room & Peers ================= */
-  setRoomId(roomId, isHost = false) {
-    this.state.room.roomId = roomId;
-    this.state.room.isHost = isHost;
-    if (!roomId) {
-      this.state.room.peers = {};
-      this.state.room.connectionStatus = 'disconnected';
-    }
-    this.notify();
-  }
-
-  setConnectionStatus(status) {
-    this.state.room.connectionStatus = status;
-    this.notify();
-  }
-
-  setSyncTimers(enabled) {
-    this.state.room.syncTimers = enabled;
-    this.notify();
-  }
-
-  updatePeer(peerId, peerData) {
-    this.state.room.peers[peerId] = {
-      ...this.state.room.peers[peerId],
-      ...peerData,
-      lastSeen: Date.now(),
+  /** Clones a teammate's checklist. Returns the previous quest so the caller can offer undo. */
+  importSteppingStones(stones, title) {
+    const incoming = sanitizeStones(stones).map((s) => ({ ...s, id: makeId(), completed: false }));
+    if (!incoming.length) return null;
+    const previous = structuredClone(this.state.quest);
+    this.state.quest = {
+      title: this.state.quest.title || cleanText(title, LIMITS.questLength),
+      stones: incoming,
     };
     this.notify();
+    return previous;
+  }
+
+  /* ============================ Timer & Rounds ============================ */
+
+  isFollowing() {
+    const r = this.state.room;
+    return Boolean(r.roomId && !r.isHost && r.hostLinked && r.followHost);
+  }
+
+  setPhase(mode, round = this.state.session.currentRound, durationMs = null) {
+    if (!MODES.includes(mode)) return;
+    Object.assign(this.state.session, {
+      mode,
+      status: 'idle',
+      currentRound: Math.max(1, round),
+      durationMs: durationMs ?? this.getDurationForMode(mode),
+      elapsedMs: 0,
+      anchorTs: null,
+    });
+  }
+
+  startTimer(now = Date.now()) {
+    const s = this.state.session;
+    if (s.status === 'running') return;
+    if (s.status === 'complete') this.setPhase('sprint', 1);
+    s.status = 'running';
+    s.anchorTs = now - s.elapsedMs;
+    this.rollStatsDay();
+    this.notify();
+  }
+
+  pauseTimer(now = Date.now()) {
+    const s = this.state.session;
+    if (s.status !== 'running') return;
+    s.elapsedMs = Math.min(s.durationMs, getElapsedMs(s, now));
+    s.status = 'paused';
+    s.anchorTs = null;
+    this.notify();
+  }
+
+  /**
+   * First press restarts the current phase; pressing again on an untouched
+   * phase restarts the whole session. Returns which one happened.
+   */
+  reset() {
+    const s = this.state.session;
+    const untouched = s.status === 'idle' && s.elapsedMs === 0;
+    if (untouched || s.status === 'complete') {
+      this.setPhase('sprint', 1);
+      this.notify();
+      return 'session';
+    }
+    this.setPhase(s.mode, s.currentRound, s.durationMs);
+    this.notify();
+    return 'phase';
+  }
+
+  /** Puts back a session snapshot (used to undo an accidental restart). */
+  restoreSession(snapshot) {
+    if (!snapshot || !MODES.includes(snapshot.mode)) return;
+    this.state.session = { ...snapshot };
+    this.notify();
+  }
+
+  rollStatsDay() {
+    if (this.state.stats.day !== todayKey()) {
+      this.state.stats = { day: todayKey(), sprints: 0, focusMs: 0 };
+    }
+  }
+
+  /**
+   * Moves to the next phase. `natural` is true when the timer ran out (vs. skip).
+   * Returns a description of the transition for sounds/announcements.
+   */
+  advanceSession({ natural = true, suppressAutoStart = false, now = Date.now() } = {}) {
+    const s = this.state.session;
+    const c = this.state.config;
+    const from = s.mode;
+    const round = s.currentRound;
+
+    if (s.status === 'complete') return { from, to: from, round, completedSession: true, autoStart: false };
+
+    if (from === 'sprint') {
+      this.rollStatsDay();
+      const elapsed = Math.min(s.durationMs, getElapsedMs(s, now));
+      this.state.stats.focusMs += elapsed;
+      if (natural || elapsed >= s.durationMs * 0.5) this.state.stats.sprints += 1;
+    }
+
+    if (from === 'sprint' && c.totalRounds > 0 && round >= c.totalRounds) {
+      Object.assign(s, { status: 'complete', elapsedMs: s.durationMs, anchorTs: null });
+      this.notify();
+      return { from, to: 'complete', round, completedSession: true, autoStart: false };
+    }
+
+    let to;
+    let nextRound = round;
+    let autoStart;
+    if (from === 'sprint') {
+      to = round % c.roundsBeforeLongRest === 0 ? 'longRest' : 'shortRest';
+      autoStart = c.autoStartBreaks;
+    } else {
+      to = 'sprint';
+      nextRound = round + 1;
+      autoStart = c.autoStartSprints;
+    }
+    if (suppressAutoStart) autoStart = false;
+
+    this.setPhase(to, nextRound);
+    if (autoStart) {
+      s.status = 'running';
+      s.anchorTs = now;
+    }
+    this.notify();
+    return { from, to, round: nextRound, completedSession: false, autoStart };
+  }
+
+  /**
+   * Mirrors a linked host's timer. Returns true when the phase changed
+   * (so the caller can play the transition cue).
+   */
+  applyHostTimer(timer, receivedAt = Date.now()) {
+    if (!timer || !MODES.includes(timer.mode)) return false;
+    const s = this.state.session;
+    const hostElapsed = Math.max(0, Number(timer.elapsedMs) || 0);
+    const durationMs = Math.max(1000, Number(timer.durationMs) || s.durationMs);
+    const status = ['idle', 'running', 'paused', 'complete'].includes(timer.status) ? timer.status : 'idle';
+    const phaseChanged = s.mode !== timer.mode || s.currentRound !== timer.currentRound || (status === 'complete') !== (s.status === 'complete');
+
+    let changed = phaseChanged || s.status !== status || s.durationMs !== durationMs;
+    const localElapsed = getElapsedMs(s, receivedAt);
+    if (Math.abs(localElapsed - hostElapsed) > SYNC.followDriftMs) changed = true;
+    if (!changed) return false;
+
+    Object.assign(s, {
+      mode: timer.mode,
+      currentRound: Math.max(1, Number(timer.currentRound) || 1),
+      durationMs,
+      status,
+      elapsedMs: Math.min(durationMs, hostElapsed),
+      anchorTs: status === 'running' ? receivedAt - hostElapsed : null,
+    });
+    this.notify();
+    return phaseChanged;
+  }
+
+  /* ============================== Room & Peers ============================== */
+
+  setRoom(patch) {
+    Object.assign(this.state.room, patch);
+    if (patch.roomId === null) {
+      Object.assign(this.state.room, { isHost: false, peers: {}, hostLinked: false, hostName: null, linkTimers: false });
+    }
+    this.notify({ persist: false });
+  }
+
+  updatePeer(peerId, data) {
+    this.state.room.peers[peerId] = { ...this.state.room.peers[peerId], ...data, lastSeen: Date.now() };
+    this.notify({ persist: false });
   }
 
   removePeer(peerId) {
-    if (this.state.room.peers[peerId]) {
-      delete this.state.room.peers[peerId];
-      this.notify();
-    }
+    if (!this.state.room.peers[peerId]) return;
+    delete this.state.room.peers[peerId];
+    this.notify({ persist: false });
   }
 }
 

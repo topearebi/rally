@@ -1,433 +1,269 @@
 /**
- * Rally - Application Bootstrap & Orchestrator
- * Connects worker lifecycle, sound profile auditioning, task list cloning, and P2P mesh.
+ * Rally - Bootstrap.
+ * Wires the store, timer engine, room sync and views together and binds user input.
+ * Broadcasting to the room is automatic: any local change that affects what friends
+ * see is sent by peer-sync's store subscription, so handlers here never call it.
  */
 
 import { store } from './state.js';
-import { ui } from './ui.js';
+import { timer } from './timer.js';
 import { sound } from './audio.js';
 import { peerSync } from './peer-sync.js';
+import { ui } from './ui.js';
+import { $ } from './dom.js';
+import { showToast } from './toast.js';
 
-class Application {
-  constructor() {
-    this.worker = null;
-    this.wakeLockSentinel = null;
+const click = (id, fn) => $(id)?.addEventListener('click', fn);
 
-    this.initWorker();
-    this.bindDOMEvents();
-    this.bindKeyboardShortcuts();
-    this.subscribeToStore();
-    this.checkRoomHash();
-    this.registerServiceWorker();
-  }
-
-  /**
-   * Initializes the Web Worker for accurate background timing
-   */
-  initWorker() {
-    try {
-      this.worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-
-      this.worker.onmessage = (event) => {
-        const { type, remainingMs } = event.data;
-
-        if (type === 'TICK') {
-          store.updateRemaining(remainingMs);
-          peerSync.broadcast();
-        } else if (type === 'COMPLETE') {
-          this.handleSessionCompletion();
-        }
-      };
-    } catch (err) {
-      console.warn('Dedicated worker failed to load. Running local execution fallback:', err);
+function bindTimerControls() {
+  click('primary-toggle-btn', () => {
+    sound.playTactileClick();
+    if (store.getState().session.status === 'complete') {
+      store.reset();
+      ui.announce('New session ready. Round 1.');
+    } else {
+      timer.toggle();
     }
-  }
+  });
 
-  /**
-   * Dispatches phase-distinct audio cues and triggers auto-start transitions
-   */
-  handleSessionCompletion() {
-    const previousState = store.getState();
-    const previousMode = previousState.session.mode;
-
-    // Advance session and calculate next phase and round
-    const { nextMode, shouldAutoStart } = store.advanceSession();
-    const state = store.getState();
-
-    // Trigger distinct acoustic cues based on the destination phase and active profile
-    if (state.config.soundEnabled) {
-      if (nextMode === 'longRest') {
-        sound.playLongRestFanfare();
-      } else if (nextMode === 'shortRest') {
-        sound.playSprintComplete();
-      } else if (nextMode === 'sprint') {
-        sound.playRestComplete();
-      }
+  click('reset-btn', () => {
+    sound.playTactileClick();
+    const before = structuredClone(store.getState().session);
+    const what = timer.reset();
+    if (what === 'session' && (before.currentRound > 1 || before.mode !== 'sprint')) {
+      showToast('Restarted from round 1.', { actionLabel: 'Undo', onAction: () => store.restoreSession(before) });
+    } else if (what === 'phase' && before.elapsedMs + (before.anchorTs ? Date.now() - before.anchorTs : 0) > 5000) {
+      showToast('Phase restarted.', { actionLabel: 'Undo', onAction: () => store.restoreSession(before) });
     }
+    ui.announce(what === 'session' ? 'Session restarted from round 1.' : 'Phase restarted.');
+  });
 
-    ui.announce(`${ui.getModeLabel(previousMode)} completed. Now starting ${ui.getModeLabel(nextMode)}.`);
+  click('skip-btn', () => {
+    sound.unlock();
+    timer.skip();
+  });
 
-    if (!shouldAutoStart) {
-      this.releaseWakeLock();
-    }
-
-    peerSync.broadcast();
-  }
-
-  /**
-   * Subscribes UI and worker to state changes
-   */
-  subscribeToStore() {
-    store.subscribe((state) => {
-      ui.render(state);
-
-      if (this.worker) {
-        if (state.session.status === 'running') {
-          this.worker.postMessage({
-            command: 'START',
-            remainingMs: state.session.remainingMs,
-            targetTime: state.session.targetTimestamp,
-            timerDirection: state.config.timerDirection,
-            totalDurationMs: state.session.totalDurationMs,
-          });
-          this.requestWakeLock();
-        } else {
-          this.worker.postMessage({ command: 'PAUSE' });
-          this.releaseWakeLock();
-        }
-      }
-    });
-  }
-
-  /**
-   * Binds interactive DOM buttons, inputs, modal controls, and delegation
-   */
-  bindDOMEvents() {
-    // 1. In-place Quick Nickname Editor (Header)
-    const inlineNameInput = document.getElementById('inline-name-input');
-    if (inlineNameInput) {
-      const commitName = () => {
-        const val = inlineNameInput.value.trim();
-        if (val) {
-          store.updateProfile(val);
-          peerSync.broadcast();
-        }
-      };
-      inlineNameInput.addEventListener('change', commitName);
-      inlineNameInput.addEventListener('blur', commitName);
-      inlineNameInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          inlineNameInput.blur();
-        }
-      });
-    }
-
-    // 2. Primary Start / Pause button
-    const toggleBtn = document.getElementById('primary-toggle-btn');
-    toggleBtn.addEventListener('click', () => {
-      sound.playTactileClick();
-      const { status } = store.getState().session;
-      if (status === 'running') {
-        store.pauseTimer();
-      } else {
-        store.startTimer();
-      }
-      peerSync.broadcast();
-    });
-
-    // 3. Reset button
-    const resetBtn = document.getElementById('reset-btn');
-    resetBtn.addEventListener('click', () => {
-      sound.playTactileClick();
-      store.resetTimer();
-      peerSync.broadcast();
-    });
-
-    // 4. Skip button
-    const skipBtn = document.getElementById('skip-btn');
-    skipBtn.addEventListener('click', () => {
-      sound.playTactileClick();
-      this.handleSessionCompletion();
-    });
-
-    // 5. Contextual Live Sync Banner (Main screen)
-    const toggleSyncBtn = document.getElementById('toggle-sync-btn');
-    if (toggleSyncBtn) {
-      toggleSyncBtn.addEventListener('click', () => {
-        sound.playTactileClick();
-        const current = store.getState().room.syncTimers;
-        store.setSyncTimers(!current);
-        peerSync.broadcast();
-      });
-    }
-
-    // 6. Current Quest Title input
-    const questInput = document.getElementById('quest-title-input');
-    questInput.addEventListener('input', (e) => {
-      store.setQuestTitle(e.target.value);
-      peerSync.broadcast();
-    });
-
-    // 7. Add Stepping Stone Form
-    const addStoneForm = document.getElementById('add-stone-form');
-    const newStoneInput = document.getElementById('new-stone-input');
-    addStoneForm.addEventListener('submit', (e) => {
-      e.preventDefault();
-      const text = newStoneInput.value.trim();
-      if (text) {
-        sound.playTactileClick();
-        store.addSteppingStone(text);
-        newStoneInput.value = '';
-        peerSync.broadcast();
-      }
-    });
-
-    // 8. Squad Task List Cloning (Event Delegation on Peer Grid)
-    const peerGrid = document.getElementById('peer-grid');
-    if (peerGrid) {
-      peerGrid.addEventListener('click', (e) => {
-        const copyBtn = e.target.closest('.peer-copy-btn');
-        if (!copyBtn) return;
-
-        const peerId = copyBtn.getAttribute('data-peer-id');
-        const peers = store.getState().room.peers;
-        const targetPeer = peers[peerId];
-
-        if (targetPeer && Array.isArray(targetPeer.quest?.stones) && targetPeer.quest.stones.length > 0) {
-          sound.playTactileClick();
-          store.importSteppingStones(targetPeer.quest.stones, targetPeer.quest.title);
-          copyBtn.textContent = 'Copied!';
-          setTimeout(() => {
-            copyBtn.textContent = 'Copy Steps';
-          }, 2000);
-          peerSync.broadcast();
-        }
-      });
-    }
-
-    // 9. Sound Profile Audition / Preview Button
-    const previewSoundBtn = document.getElementById('preview-sound-btn');
-    const soundProfileSelect = document.getElementById('sound-profile-select');
-    if (previewSoundBtn && soundProfileSelect) {
-      previewSoundBtn.addEventListener('click', () => {
-        const selectedProfile = soundProfileSelect.value || 'warm';
-        sound.previewProfile(selectedProfile);
-      });
-    }
-
-    // 10. Settings Modal Open / Close triggers
-    const openSettingsBtn = document.getElementById('open-settings-btn');
-    const closeSettingsBtn = document.getElementById('close-settings-btn');
-    const settingsForm = document.getElementById('settings-form');
-
-    openSettingsBtn.addEventListener('click', () => {
-      sound.playTactileClick();
-      ui.openSettings();
-    });
-
-    closeSettingsBtn.addEventListener('click', () => {
-      sound.playTactileClick();
-      ui.closeSettings();
-    });
-
-    // 11. Settings Form Submission (Second precision calculation & sound theme)
-    settingsForm.addEventListener('submit', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      sound.playTactileClick();
-
-      // Compute total seconds for sprint
-      const sprintM = parseFloat(document.getElementById('sprint-min').value) || 0;
-      const sprintS = parseFloat(document.getElementById('sprint-sec').value) || 0;
-      const totalSprintSec = Math.max(1, Math.round(sprintM * 60 + sprintS));
-
-      // Compute total seconds for short rest
-      const shortM = parseFloat(document.getElementById('short-rest-min').value) || 0;
-      const shortS = parseFloat(document.getElementById('short-rest-sec').value) || 0;
-      const totalShortSec = Math.max(1, Math.round(shortM * 60 + shortS));
-
-      // Compute total seconds for long rest
-      const longM = parseFloat(document.getElementById('long-rest-min').value) || 0;
-      const longS = parseFloat(document.getElementById('long-rest-sec').value) || 0;
-      const totalLongSec = Math.max(1, Math.round(longM * 60 + longS));
-
-      const roundsBeforeLong = parseInt(document.getElementById('rounds-before-long').value, 10);
-      const totalRounds = parseInt(document.getElementById('total-rounds').value, 10);
-      const autoStartBreaks = document.getElementById('auto-start-breaks').checked;
-      const autoStartSprints = document.getElementById('auto-start-sprints').checked;
-      const direction = document.getElementById('timer-direction-select').value;
-      const soundEnabled = document.getElementById('sound-toggle').checked;
-      const soundProfile = document.getElementById('sound-profile-select').value;
-
-      store.updateConfig({
-        sprintDurationSeconds: totalSprintSec,
-        shortRestDurationSeconds: totalShortSec,
-        longRestDurationSeconds: totalLongSec,
-        roundsBeforeLongRest: Math.max(1, roundsBeforeLong || 4),
-        totalRounds: Math.max(0, isNaN(totalRounds) ? 4 : totalRounds),
-        autoStartBreaks,
-        autoStartSprints,
-        timerDirection: direction,
-        soundEnabled,
-        soundProfile,
-      });
-
-      ui.closeSettings();
-      peerSync.broadcast();
-    });
-
-    // 12. Squad Room Modal & Sharing
-    const roomBtn = document.getElementById('room-btn');
-    const closeRoomBtn = document.getElementById('close-room-btn');
-    const copyLinkBtn = document.getElementById('copy-link-btn');
-    const leaveRoomBtn = document.getElementById('leave-room-btn');
-    const retryConnectionBtn = document.getElementById('retry-connection-btn');
-    const joinRoomForm = document.getElementById('join-room-form');
-    const joinCodeInput = document.getElementById('join-code-input');
-
-    roomBtn.addEventListener('click', async () => {
-      sound.playTactileClick();
-      const currentRoom = store.getState().room.roomId;
-      if (!currentRoom) {
-        await peerSync.createRoom();
-      }
-      ui.openRoom();
-    });
-
-    closeRoomBtn.addEventListener('click', () => {
-      sound.playTactileClick();
-      ui.closeRoom();
-    });
-
-    // Direct Join via Room Code Form
-    if (joinRoomForm && joinCodeInput) {
-      joinRoomForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        sound.playTactileClick();
-        const code = joinCodeInput.value.trim();
-        if (code) {
-          try {
-            await peerSync.joinByCode(code);
-            joinCodeInput.value = '';
-            ui.closeRoom();
-          } catch (err) {
-            alert(`Unable to join room: ${err.message}`);
-          }
-        }
-      });
-    }
-
-    // Manual Reconnection Action
-    if (retryConnectionBtn) {
-      retryConnectionBtn.addEventListener('click', async () => {
-        sound.playTactileClick();
-        await peerSync.reconnect();
-      });
-    }
-
-    // Share link copy action
-    copyLinkBtn.addEventListener('click', async () => {
-      sound.playTactileClick();
-      const shareInput = document.getElementById('share-link-input');
-      try {
-        await navigator.clipboard.writeText(shareInput.value);
-        copyLinkBtn.textContent = 'Copied!';
-        setTimeout(() => {
-          copyLinkBtn.textContent = 'Copy';
-        }, 2000);
-      } catch {
-        shareInput.select();
-        document.execCommand('copy');
-      }
-    });
-
-    // Leave room action
-    leaveRoomBtn.addEventListener('click', () => {
-      sound.playTactileClick();
-      peerSync.leaveRoom();
-      ui.closeRoom();
-    });
-  }
-
-  /**
-   * Auto-joins a room if a room hash parameter is present in the URL
-   */
-  async checkRoomHash() {
-    const hash = window.location.hash;
-    const match = hash.match(/room=([a-zA-Z0-9_-]+)/);
-    if (match && match[1]) {
-      const targetRoom = match[1];
-      try {
-        await peerSync.joinRoom(targetRoom);
-      } catch (err) {
-        console.warn('Could not auto-join room from URL hash:', err);
-      }
-    }
-  }
-
-  /**
-   * Global keyboard navigation & shortcuts
-   */
-  bindKeyboardShortcuts() {
-    window.addEventListener('keydown', (e) => {
-      if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
-        return;
-      }
-
-      if (e.code === 'Space') {
-        e.preventDefault();
-        const { status } = store.getState().session;
-        if (status === 'running') {
-          store.pauseTimer();
-        } else {
-          store.startTimer();
-        }
-        peerSync.broadcast();
-      } else if (e.code === 'KeyR' && e.altKey) {
-        e.preventDefault();
-        store.resetTimer();
-        peerSync.broadcast();
-      } else if (e.code === 'KeyS' && e.altKey) {
-        e.preventDefault();
-        this.handleSessionCompletion();
-      }
-    });
-  }
-
-  /**
-   * Screen Wake Lock API management
-   */
-  async requestWakeLock() {
-    if ('wakeLock' in navigator && !this.wakeLockSentinel) {
-      try {
-        this.wakeLockSentinel = await navigator.wakeLock.request('screen');
-        this.wakeLockSentinel.addEventListener('release', () => {
-          this.wakeLockSentinel = null;
-        });
-      } catch (err) {
-        console.info('Wake lock request denied:', err);
-      }
-    }
-  }
-
-  releaseWakeLock() {
-    if (this.wakeLockSentinel) {
-      this.wakeLockSentinel.release();
-      this.wakeLockSentinel = null;
-    }
-  }
-
-  registerServiceWorker() {
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker
-          .register('./sw.js', { scope: './' })
-          .catch((err) => console.warn('Service worker registration failed:', err));
-      });
-    }
-  }
+  timer.onTransition((message) => ui.announce(message));
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  new Application();
-});
+function bindIdentityAndQuest() {
+  const name = $('inline-name-input');
+  const commitName = () => {
+    if (name.value.trim()) store.updateProfile({ displayName: name.value });
+    else name.value = store.getState().profile.displayName;
+  };
+  name.addEventListener('change', commitName);
+  name.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') name.blur();
+    if (e.key === 'Escape') {
+      name.value = store.getState().profile.displayName;
+      name.blur();
+    }
+  });
+
+  const title = $('quest-title-input');
+  title.addEventListener('input', () => store.setQuestTitle(title.value));
+  title.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('new-stone-input').focus();
+  });
+
+  const form = $('add-stone-form');
+  const input = $('new-stone-input');
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!input.value.trim()) return;
+    if (store.addSteppingStone(input.value)) {
+      sound.playTactileClick();
+      input.value = '';
+    } else {
+      showToast('That list is full — try finishing or clearing a few steps.');
+    }
+  });
+
+  click('focus-view-btn', () => toggleFocusView());
+}
+
+function toggleFocusView() {
+  const next = !store.getState().config.focusView;
+  store.updateConfig({ focusView: next });
+  ui.announce(next ? 'Focus view on. Only the timer and current step are shown.' : 'Focus view off.');
+}
+
+function bindDialogs() {
+  // Shared: [data-close-dialog] buttons, and clicking the dimmed backdrop.
+  document.querySelectorAll('dialog').forEach((dialog) => {
+    dialog.addEventListener('click', (e) => {
+      if (e.target.closest('[data-close-dialog]') || e.target === dialog) dialog.close();
+    });
+  });
+
+  /* ------------------------------ Preferences ------------------------------ */
+  click('open-settings-btn', () => ui.openSettings(store.getState().config));
+
+  $('preset-row').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-preset]');
+    if (btn) ui.applyPreset(btn.dataset.preset);
+  });
+  $('settings-form').addEventListener('input', (e) => {
+    if (e.target.matches('[id$="-min"], [id$="-sec"]')) ui.syncPresetHighlight();
+  });
+  click('preview-sound-btn', () => sound.previewProfile($('sound-profile-select').value));
+
+  $('notify-toggle').addEventListener('change', async (e) => {
+    if (!e.target.checked || !('Notification' in window) || Notification.permission === 'granted') return;
+    const result = await Notification.requestPermission().catch(() => 'denied');
+    if (result !== 'granted') {
+      e.target.checked = false;
+      showToast('Notifications are blocked for this site in your browser settings.');
+    }
+  });
+
+  $('settings-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    store.updateConfig(ui.readSettings());
+    $('settings-dialog').close();
+    showToast('Preferences saved.', { duration: 2200 });
+  });
+
+  /* ------------------------------ Room ------------------------------ */
+  click('room-btn', () => ui.openRoom());
+
+  $('room-dialog').addEventListener('close', () => {
+    const { room } = store.getState();
+    if (room.error && !room.roomId) store.setRoom({ error: null });
+  });
+
+  click('create-room-btn', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Opening…';
+    try {
+      await peerSync.createRoom();
+      ui.renderRoomDialog(store.getState());
+      $('copy-link-btn').focus();
+    } catch (_) {
+      /* error is shown in the dialog */
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Start a room';
+    }
+  });
+
+  $('join-room-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = $('join-code-input');
+    const btn = $('join-room-btn');
+    btn.disabled = true;
+    btn.textContent = 'Joining…';
+    try {
+      await peerSync.joinRoom(input.value);
+      input.value = '';
+    } catch (err) {
+      store.setRoom({ error: err.message });
+      input.focus();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Join';
+    }
+  });
+
+  click('copy-link-btn', async (e) => {
+    const btn = e.currentTarget;
+    const field = $('share-link-input');
+    try {
+      await navigator.clipboard.writeText(field.value);
+    } catch (_) {
+      field.select();
+      document.execCommand('copy');
+    }
+    btn.textContent = 'Copied ✓';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  });
+
+  click('share-link-btn', () => {
+    navigator.share?.({ title: 'Focus with me on Rally', text: 'Join my Rally room so we can focus together:', url: $('share-link-input').value }).catch(() => {});
+  });
+
+  click('retry-connection-btn', () => peerSync.reconnect().catch(() => {}));
+
+  click('leave-room-btn', () => {
+    peerSync.leaveRoom();
+    showToast('You left the room. Your timer and steps are untouched.');
+  });
+
+  const setLink = (on) => {
+    store.setRoom({ linkTimers: on });
+    ui.announce(on ? "Linked. Everyone's timers now follow yours." : 'Unlinked. Everyone runs their own timer.');
+  };
+  click('toggle-sync-btn', () => setLink(!store.getState().room.linkTimers));
+  $('room-link-toggle').addEventListener('change', (e) => setLink(e.target.checked));
+
+  $('room-follow-toggle').addEventListener('change', (e) => store.setRoom({ followHost: e.target.checked }));
+  click('unfollow-btn', () => {
+    store.setRoom({ followHost: false });
+    showToast("You're on your own timer now.", { actionLabel: 'Follow again', onAction: () => store.setRoom({ followHost: true }) });
+  });
+}
+
+function bindKeyboardShortcuts() {
+  window.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.defaultPrevented) return;
+    if (document.querySelector('dialog[open]')) return;
+    const t = e.target;
+    if (t.closest?.('input, select, textarea, [contenteditable="true"]')) return;
+
+    if (e.code === 'Space' && !e.altKey) {
+      // Let a focused button / disclosure handle its own Space press.
+      if (t.closest?.('button, summary, a')) return;
+      e.preventDefault();
+      $('primary-toggle-btn').click();
+    } else if (e.altKey && e.code === 'KeyR') {
+      e.preventDefault();
+      $('reset-btn').click();
+    } else if (e.altKey && e.code === 'KeyS') {
+      e.preventDefault();
+      $('skip-btn').click();
+    } else if (!e.altKey && e.code === 'KeyF') {
+      e.preventDefault();
+      toggleFocusView();
+    } else if (!e.altKey && e.code === 'KeyN') {
+      e.preventDefault();
+      if (store.getState().config.focusView) toggleFocusView();
+      $('new-stone-input').focus();
+    }
+  });
+}
+
+function joinFromHash() {
+  const match = location.hash.match(/room=([A-Za-z0-9_-]+)/);
+  if (!match) return;
+  const { roomId } = store.getState().room;
+  if (roomId && roomId.endsWith(match[1].replace(/^rally-/, ''))) return;
+  peerSync.joinRoom(match[1]).catch(() => ui.openRoom());
+}
+
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {});
+  });
+}
+
+function boot() {
+  ui.init();
+  store.subscribe((state) => ui.render(state));
+  timer.onTick((_state, now) => ui.renderClock(store.getState(), now));
+  timer.init();
+  peerSync.init();
+
+  bindTimerControls();
+  bindIdentityAndQuest();
+  bindDialogs();
+  bindKeyboardShortcuts();
+
+  joinFromHash();
+  window.addEventListener('hashchange', joinFromHash);
+  registerServiceWorker();
+}
+
+boot();

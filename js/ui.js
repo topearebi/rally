@@ -1,604 +1,324 @@
 /**
- * Rally - UI Controller & DOM Orchestrator
- * Manages active step spotlight, inline task editing/reordering, count-up dial progress,
- * and flicker-free squad peer card reconciliation.
+ * Rally - UI controller.
+ * `render(state)` runs on real state changes; `renderClock(state, now)` runs on every
+ * tick and touches only the digits, ring, title and favicon.
  */
 
+import { getElapsedMs } from './state.js';
+import { MODE_LABELS, PRESETS } from './config.js';
+import { $, h, setText, setAttr, formatClock, formatDuration, formatWallClock } from './dom.js';
 import { dynamicFavicon } from './favicon.js';
-import { store } from './state.js';
-import { peerSync } from './peer-sync.js';
+import { questView } from './quest-view.js';
+import { peersView } from './peers-view.js';
+import { peerSync, roomCodeFromId } from './peer-sync.js';
+
+const CIRCUMFERENCE = 2 * Math.PI * 150;
 
 class UIController {
   constructor() {
-    this.html = document.documentElement;
-
-    // Header & Identity elements
-    this.inlineNameInput = document.getElementById('inline-name-input');
-    this.roomBtn = document.getElementById('room-btn');
-    this.roomStatusIndicator = document.getElementById('room-status-indicator');
-
-    // Timer & Round HUD elements
-    this.roundHudBadge = document.getElementById('round-hud-badge');
-    this.cycleDotsContainer = document.getElementById('cycle-dots-container');
-    this.timerDisplay = document.getElementById('timer-display');
-    this.sessionModeBadge = document.getElementById('session-mode-badge');
-    this.progressIndicator = document.getElementById('progress-indicator');
-    this.primaryToggleBtn = document.getElementById('primary-toggle-btn');
-    this.a11yAnnouncer = document.getElementById('a11y-announcer');
-
-    // Live Sync Banner elements
-    this.syncBanner = document.getElementById('sync-banner');
-    this.toggleSyncBtn = document.getElementById('toggle-sync-btn');
-    this.syncStatusIcon = document.getElementById('sync-status-icon');
-    this.syncStatusLabel = document.getElementById('sync-status-label');
-
-    // Quest, Spotlight & Drawer elements
-    this.questTitleInput = document.getElementById('quest-title-input');
-    this.stonesCounter = document.getElementById('stones-counter');
-    this.activeStoneContainer = document.getElementById('active-stone-container');
-    this.upcomingStonesDrawer = document.getElementById('upcoming-stones-drawer');
-    this.upcomingCountBadge = document.getElementById('upcoming-count-badge');
-    this.steppingStonesList = document.getElementById('stepping-stones-list');
-    this.completedStonesDrawer = document.getElementById('completed-stones-drawer');
-    this.completedCountBadge = document.getElementById('completed-count-badge');
-    this.completedStonesList = document.getElementById('completed-stones-list');
-
-    // Peer Grid elements
-    this.peerSection = document.getElementById('peer-section');
-    this.peerGrid = document.getElementById('peer-grid');
-
-    // Settings Modal elements
-    this.settingsDialog = document.getElementById('settings-dialog');
-    this.sprintMinInput = document.getElementById('sprint-min');
-    this.sprintSecInput = document.getElementById('sprint-sec');
-    this.shortRestMinInput = document.getElementById('short-rest-min');
-    this.shortRestSecInput = document.getElementById('short-rest-sec');
-    this.longRestMinInput = document.getElementById('long-rest-min');
-    this.longRestSecInput = document.getElementById('long-rest-sec');
-    this.roundsBeforeLongInput = document.getElementById('rounds-before-long');
-    this.totalRoundsInput = document.getElementById('total-rounds');
-    this.autoStartBreaksToggle = document.getElementById('auto-start-breaks');
-    this.autoStartSprintsToggle = document.getElementById('auto-start-sprints');
-    this.timerDirectionSelect = document.getElementById('timer-direction-select');
-    this.soundToggle = document.getElementById('sound-toggle');
-    this.soundProfileSelect = document.getElementById('sound-profile-select');
-
-    // Room Modal elements
-    this.roomDialog = document.getElementById('room-dialog');
-    this.roomModalStatus = document.getElementById('room-modal-status');
-    this.retryConnectionBtn = document.getElementById('retry-connection-btn');
-    this.roomShareSection = document.getElementById('room-share-section');
-    this.displayRoomCode = document.getElementById('display-room-code');
-    this.shareLinkInput = document.getElementById('share-link-input');
-    this.leaveRoomBtn = document.getElementById('leave-room-btn');
-
-    // SVG radial progress setup (r = 150 -> 2 * PI * 150 ≈ 942.48)
-    this.circumference = 2 * Math.PI * 150;
-    this.lastAnnouncedMinute = null;
+    this.root = document.documentElement;
+    this.el = {
+      nameInput: $('inline-name-input'),
+      nameDot: $('name-dot'),
+      roomBtn: $('room-btn'),
+      roomLabel: $('room-status-indicator'),
+      focusViewBtn: $('focus-view-btn'),
+      followBanner: $('follow-banner'),
+      followLabel: $('follow-label'),
+      roundHud: $('round-hud-badge'),
+      digits: $('timer-display'),
+      modePill: $('session-mode-badge'),
+      endsAt: $('ends-at'),
+      dots: $('cycle-dots-container'),
+      ring: $('progress-indicator'),
+      resetBtn: $('reset-btn'),
+      primaryBtn: $('primary-toggle-btn'),
+      skipBtn: $('skip-btn'),
+      linkToggle: $('toggle-sync-btn'),
+      linkLabel: $('sync-status-label'),
+      todayStats: $('today-stats'),
+      questTitle: $('quest-title-input'),
+      announcer: $('a11y-announcer'),
+      settingsDialog: $('settings-dialog'),
+      presetRow: $('preset-row'),
+      roomDialog: $('room-dialog'),
+    };
+    this.dotsKey = '';
+    this.lastMinuteAnnounced = null;
+    this.state = null;
   }
 
-  formatTime(ms) {
-    const totalSeconds = Math.ceil(ms / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-  }
-
-  getModeLabel(mode) {
-    switch (mode) {
-      case 'shortRest':
-        return 'Short Rest';
-      case 'longRest':
-        return 'Long Rest';
-      case 'sprint':
-      default:
-        return 'Sprint';
-    }
+  init() {
+    this.el.ring.style.strokeDasharray = `${CIRCUMFERENCE}`;
+    questView.init({ announce: (m) => this.announce(m) });
+    peersView.init();
+    this.buildPresets();
   }
 
   announce(message) {
-    if (this.a11yAnnouncer) {
-      this.a11yAnnouncer.textContent = message;
-    }
+    // Clear first so repeating the same message is still read out.
+    this.el.announcer.textContent = '';
+    requestAnimationFrame(() => { this.el.announcer.textContent = message; });
   }
+
+  /* ============================ full render ============================ */
 
   render(state) {
-    const { session, config, quest, room, profile } = state;
-    const { mode, status, remainingMs, totalDurationMs, currentRound } = session;
+    this.state = state;
+    const { session, config, quest, room, profile, stats } = state;
+    const following = Boolean(room.roomId && !room.isHost && room.hostLinked && room.followHost);
 
-    // 1. Theme and mode pill
-    this.html.setAttribute('data-theme-mode', mode);
-    this.sessionModeBadge.textContent = this.getModeLabel(mode);
+    setAttr(this.root, 'data-theme-mode', session.mode);
+    setAttr(document.body, 'data-session-status', session.status);
+    setAttr(document.body, 'data-focus-view', config.focusView);
+    setAttr(this.el.focusViewBtn, 'aria-pressed', config.focusView);
 
-    // 2. Inline nickname field (preserve input focus)
-    if (this.inlineNameInput && document.activeElement !== this.inlineNameInput) {
-      this.inlineNameInput.value = profile.displayName;
-    }
+    // Identity
+    if (document.activeElement !== this.el.nameInput) this.el.nameInput.value = profile.displayName;
+    document.body.style.setProperty('--me-color', profile.avatarColor);
 
-    // 3. Round HUD and Cycle Dots
-    const totalRoundsText = config.totalRounds > 0 ? ` of ${config.totalRounds}` : '';
-    this.roundHudBadge.textContent = `Round ${currentRound}${totalRoundsText}`;
-    this.renderCycleDots(currentRound, config.roundsBeforeLongRest);
+    // Rounds
+    const roundText = session.status === 'complete'
+      ? 'Session complete'
+      : `Round ${session.currentRound}${config.totalRounds > 0 ? ` of ${config.totalRounds}` : ''}`;
+    setText(this.el.roundHud, roundText);
+    setText(this.el.modePill, MODE_LABELS[session.mode]);
+    this.el.modePill.hidden = session.status === 'complete';
+    this.renderCycleDots(session, config);
 
-    // 4. Digits & Primary Toggle Button
-    const timeFormatted = this.formatTime(remainingMs);
-    this.timerDisplay.textContent = timeFormatted;
+    // Controls
+    const labels = {
+      running: ['Pause', `Pause ${MODE_LABELS[session.mode].toLowerCase()}`],
+      paused: ['Resume', `Resume ${MODE_LABELS[session.mode].toLowerCase()}`],
+      complete: ['New session', 'Start a new session'],
+      idle: ['Start', `Start ${MODE_LABELS[session.mode].toLowerCase()}`],
+    }[session.status];
+    setText(this.el.primaryBtn, labels[0]);
+    setAttr(this.el.primaryBtn, 'aria-label', labels[1]);
+    const freshPhase = session.status === 'idle' && session.elapsedMs === 0;
+    setAttr(this.el.resetBtn, 'aria-label', freshPhase || session.status === 'complete' ? 'Restart whole session from round 1' : 'Restart this phase');
+    this.el.resetBtn.title = freshPhase ? 'Restart session (Alt+R)' : 'Restart phase (Alt+R)';
+    for (const btn of [this.el.resetBtn, this.el.primaryBtn, this.el.skipBtn]) btn.disabled = following;
+    this.el.skipBtn.disabled = following || session.status === 'complete';
 
-    const isRunning = status === 'running';
-    this.primaryToggleBtn.textContent = isRunning ? 'Pause' : 'Start';
-    this.primaryToggleBtn.setAttribute(
-      'aria-label',
-      isRunning ? `Pause ${this.getModeLabel(mode)}` : `Start ${this.getModeLabel(mode)}`
-    );
+    // Room-linked timers
+    this.el.followBanner.hidden = !following;
+    if (following) setText(this.el.followLabel, `Following ${room.hostName || 'the host'}'s timer`);
+    this.el.linkToggle.hidden = !(room.roomId && room.isHost);
+    setAttr(this.el.linkToggle, 'aria-pressed', room.linkTimers);
+    setText(this.el.linkLabel, room.linkTimers ? "Everyone's timers follow yours" : "Link everyone's timers to mine");
 
-    // 5. Progress Dial Offset (Proper ratio calculation for countdown and count-up)
-    let elapsedRatio = 0;
-    if (totalDurationMs > 0) {
-      if (config.timerDirection === 'countup') {
-        elapsedRatio = remainingMs / totalDurationMs;
-      } else {
-        elapsedRatio = (totalDurationMs - remainingMs) / totalDurationMs;
-      }
-    }
-    const normalizedRatio = Math.min(1, Math.max(0, elapsedRatio));
-    const offset = this.circumference * (1 - normalizedRatio);
-    this.progressIndicator.style.strokeDashoffset = `${offset}px`;
+    // Today
+    setText(this.el.todayStats, stats.sprints || stats.focusMs >= 60000
+      ? `Today · ${stats.sprints} sprint${stats.sprints === 1 ? '' : 's'} · ${formatDuration(stats.focusMs)} focused`
+      : '');
 
-    // 6. Browser Title & Favicon
-    document.title = `${timeFormatted} • Rally`;
-    dynamicFavicon.update(normalizedRatio, mode);
+    // Quest
+    if (document.activeElement !== this.el.questTitle) this.el.questTitle.value = quest.title;
+    questView.render(quest);
 
-    // 7. Contextual Live Sync Banner
-    this.renderSyncBanner(room);
+    // Room
+    this.renderRoomButton(room);
+    peersView.render(room.peers);
+    if (this.el.roomDialog.open) this.renderRoomDialog(state);
 
-    // 8. Current Quest & Stepping Stones (Spotlight + Drawers with in-place edits)
-    if (document.activeElement !== this.questTitleInput) {
-      this.questTitleInput.value = quest.title;
-    }
-    this.renderSteppingStones(quest.stones);
-
-    // 9. Room Network Status & Non-destructive Peer Grid
-    this.renderRoomStatus(room);
-    this.renderPeerGrid(room.peers);
-
-    // 10. Hydrate Settings Modal Inputs without overriding active edits
-    const activeEl = document.activeElement;
-    const isEditingSettings = this.settingsDialog && this.settingsDialog.open && this.settingsDialog.contains(activeEl);
-
-    if (!isEditingSettings) {
-      const sSec = config.sprintDurationSeconds || 1500;
-      if (this.sprintMinInput) this.sprintMinInput.value = Math.floor(sSec / 60);
-      if (this.sprintSecInput) this.sprintSecInput.value = sSec % 60;
-
-      const srSec = config.shortRestDurationSeconds || 300;
-      if (this.shortRestMinInput) this.shortRestMinInput.value = Math.floor(srSec / 60);
-      if (this.shortRestSecInput) this.shortRestSecInput.value = srSec % 60;
-
-      const lrSec = config.longRestDurationSeconds || 900;
-      if (this.longRestMinInput) this.longRestMinInput.value = Math.floor(lrSec / 60);
-      if (this.longRestSecInput) this.longRestSecInput.value = lrSec % 60;
-
-      if (this.roundsBeforeLongInput) this.roundsBeforeLongInput.value = config.roundsBeforeLongRest;
-      if (this.totalRoundsInput) this.totalRoundsInput.value = config.totalRounds;
-      if (this.autoStartBreaksToggle) this.autoStartBreaksToggle.checked = config.autoStartBreaks;
-      if (this.autoStartSprintsToggle) this.autoStartSprintsToggle.checked = config.autoStartSprints;
-      if (this.timerDirectionSelect) this.timerDirectionSelect.value = config.timerDirection;
-      if (this.soundToggle) this.soundToggle.checked = config.soundEnabled;
-      if (this.soundProfileSelect) this.soundProfileSelect.value = config.soundProfile || 'warm';
-    }
-
-    // 11. Screen-reader announcements
-    this.evaluateA11yMilestones(remainingMs, status);
+    this.renderClock(state, Date.now());
   }
 
-  renderSyncBanner(room) {
-    if (!this.syncBanner || !this.toggleSyncBtn) return;
-
-    if (!room.roomId) {
-      this.syncBanner.style.display = 'none';
-      return;
+  renderCycleDots(session, config) {
+    const cycle = Math.max(1, config.roundsBeforeLongRest);
+    const position = ((session.currentRound - 1) % cycle) + 1;
+    const key = `${cycle}|${position}|${session.mode}|${session.status}`;
+    if (key === this.dotsKey) return;
+    this.dotsKey = key;
+    const dots = [];
+    for (let i = 1; i <= cycle; i++) {
+      const sprintDone = i < position || (i === position && session.mode !== 'sprint') || session.status === 'complete';
+      const state = i === position && session.mode === 'sprint' && session.status !== 'complete' ? 'current' : sprintDone ? 'done' : 'todo';
+      dots.push(h('span', { class: 'cycle-dot', dataset: { state } }));
     }
-
-    this.syncBanner.style.display = 'flex';
-    this.toggleSyncBtn.setAttribute('data-active', room.syncTimers ? 'true' : 'false');
-    this.toggleSyncBtn.setAttribute('aria-pressed', room.syncTimers ? 'true' : 'false');
-
-    if (room.syncTimers) {
-      this.syncStatusIcon.textContent = '🔗';
-      this.syncStatusLabel.textContent = room.isHost 
-        ? 'Timers Linked (You Lead)' 
-        : 'Timers Linked (Host Controls)';
-    } else {
-      this.syncStatusIcon.textContent = '🔓';
-      this.syncStatusLabel.textContent = 'Timers Independent (Co-working)';
-    }
+    this.el.dots.replaceChildren(...dots);
   }
 
-  renderCycleDots(currentRound, cycleLength) {
-    if (!this.cycleDotsContainer) return;
-    this.cycleDotsContainer.innerHTML = '';
-    
-    const safeCycle = Math.max(1, cycleLength || 4);
-    const activeDotIndex = ((currentRound - 1) % safeCycle) + 1;
+  /* ============================ per-tick render ============================ */
 
-    for (let i = 1; i <= safeCycle; i++) {
-      const dot = document.createElement('span');
-      dot.className = 'cycle-dot';
-      if (i === activeDotIndex) {
-        dot.setAttribute('data-active', 'true');
-      }
-      this.cycleDotsContainer.appendChild(dot);
+  renderClock(state, now) {
+    if (!state) return;
+    const { session, config } = state;
+    const elapsed = Math.min(session.durationMs, getElapsedMs(session, now));
+    const remaining = session.durationMs - elapsed;
+    const countUp = config.timerDirection === 'countup';
+
+    const digits = session.status === 'complete' ? 'Done!' : countUp ? formatClock(elapsed, false) : formatClock(remaining);
+    setText(this.el.digits, digits);
+
+    const ratio = session.durationMs ? elapsed / session.durationMs : 0;
+    this.el.ring.style.strokeDashoffset = `${CIRCUMFERENCE * (1 - ratio)}`;
+
+    // "Ends at" makes the time concrete — helpful for time-blindness.
+    let endsText;
+    if (session.status === 'running') endsText = `Ends at ${formatWallClock(now + remaining)}`;
+    else if (session.status === 'paused') endsText = `Paused · ${formatDuration(remaining)} left`;
+    else if (session.status === 'complete') endsText = state.stats.focusMs ? `${formatDuration(state.stats.focusMs)} focused today` : 'Nice work';
+    else endsText = `Start now → done at ${formatWallClock(now + remaining)}`;
+    setText(this.el.endsAt, endsText);
+
+    const running = session.status === 'running';
+    const title = running ? `${countUp ? formatClock(elapsed, false) : formatClock(remaining)} · ${MODE_LABELS[session.mode]} · Rally` : session.status === 'paused' ? 'Paused · Rally' : 'Rally';
+    if (document.title !== title) document.title = title;
+    dynamicFavicon.update(ratio, session.mode, session.status === 'paused');
+
+    // Screen-reader milestone: one minute left.
+    if (running && remaining <= 60000 && remaining > 55000 && this.lastMinuteAnnounced !== session.mode + session.currentRound) {
+      this.lastMinuteAnnounced = session.mode + session.currentRound;
+      this.announce(`One minute left in this ${MODE_LABELS[session.mode].toLowerCase()}.`);
     }
+
+    peersView.tick(now);
   }
 
-  /**
-   * Renders the Active Focus spotlight and partitions steps into Upcoming and Completed drawers
-   */
-  renderSteppingStones(stones) {
-    if (!this.stonesCounter) return;
+  /* ============================== room ============================== */
 
-    const completedStones = stones.filter((s) => s.completed);
-    const pendingStones = stones.filter((s) => !s.completed);
-    this.stonesCounter.textContent = `${completedStones.length} / ${stones.length}`;
-
-    // 1. Active Step Spotlight (First pending stone)
-    if (this.activeStoneContainer) {
-      const activeInput = this.activeStoneContainer.querySelector('.active-stone-input');
-      const isEditingActive = activeInput && document.activeElement === activeInput;
-
-      if (!isEditingActive) {
-        this.activeStoneContainer.innerHTML = '';
-        if (pendingStones.length > 0) {
-          const activeStone = pendingStones[0];
-          const card = document.createElement('div');
-          card.className = 'active-stone-card';
-
-          const checkbox = document.createElement('input');
-          checkbox.type = 'checkbox';
-          checkbox.className = 'stone-checkbox';
-          checkbox.checked = false;
-          checkbox.setAttribute('aria-label', `Complete active focus: "${activeStone.text}"`);
-          checkbox.addEventListener('change', () => {
-            store.toggleSteppingStone(activeStone.id);
-            peerSync.broadcast();
-          });
-
-          const body = document.createElement('div');
-          body.className = 'active-stone-body';
-
-          const label = document.createElement('span');
-          label.className = 'active-stone-label';
-          label.textContent = 'Current Focus';
-
-          const input = document.createElement('input');
-          input.type = 'text';
-          input.className = 'active-stone-input';
-          input.value = activeStone.text;
-          input.setAttribute('aria-label', 'Edit current focus task text');
-
-          const commitEdit = () => {
-            const val = input.value.trim();
-            if (val && val !== activeStone.text) {
-              store.updateSteppingStone(activeStone.id, val);
-              peerSync.broadcast();
-            }
-          };
-
-          input.addEventListener('change', commitEdit);
-          input.addEventListener('blur', commitEdit);
-          input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') input.blur();
-          });
-
-          body.appendChild(label);
-          body.appendChild(input);
-
-          const deleteBtn = document.createElement('button');
-          deleteBtn.type = 'button';
-          deleteBtn.className = 'stone-delete-btn';
-          deleteBtn.setAttribute('aria-label', `Delete "${activeStone.text}"`);
-          deleteBtn.innerHTML = '&times;';
-          deleteBtn.addEventListener('click', () => {
-            store.deleteSteppingStone(activeStone.id);
-            peerSync.broadcast();
-          });
-
-          card.appendChild(checkbox);
-          card.appendChild(body);
-          card.appendChild(deleteBtn);
-          this.activeStoneContainer.appendChild(card);
-        }
-      }
+  renderRoomButton(room) {
+    const count = Object.keys(room.peers).length + 1;
+    let status = room.connectionStatus;
+    let label = 'Invite friends';
+    if (room.roomId) {
+      if (room.error && status === 'disconnected') {
+        status = 'error';
+        label = 'Room offline';
+      } else if (status === 'connecting') label = 'Connecting…';
+      else if (status === 'connected') label = count > 1 ? `${count} in room` : 'Room open';
+      else label = 'Room offline';
     }
-
-    // 2. Upcoming Steps Drawer (Subsequent pending stones)
-    const upcomingStones = pendingStones.slice(1);
-    if (this.upcomingCountBadge) this.upcomingCountBadge.textContent = upcomingStones.length;
-    if (this.steppingStonesList) {
-      const activeElement = document.activeElement;
-      const isEditingUpcoming = this.steppingStonesList.contains(activeElement);
-
-      if (!isEditingUpcoming) {
-        this.steppingStonesList.innerHTML = '';
-        upcomingStones.forEach((stone, index) => {
-          const isFirstUpcoming = index === 0;
-          const isLastUpcoming = index === upcomingStones.length - 1;
-          this.steppingStonesList.appendChild(
-            this.createStoneListItem(stone, isFirstUpcoming, isLastUpcoming)
-          );
-        });
-      }
-    }
-
-    // 3. Completed Steps Drawer
-    if (this.completedCountBadge) this.completedCountBadge.textContent = completedStones.length;
-    if (this.completedStonesList) {
-      const activeElement = document.activeElement;
-      const isEditingCompleted = this.completedStonesList.contains(activeElement);
-
-      if (!isEditingCompleted) {
-        this.completedStonesList.innerHTML = '';
-        completedStones.forEach((stone) => {
-          this.completedStonesList.appendChild(this.createStoneListItem(stone, true, true));
-        });
-      }
-    }
+    setAttr(this.el.roomBtn, 'data-status', status);
+    setText(this.el.roomLabel, label);
+    setAttr(this.el.roomBtn, 'aria-label', room.roomId ? `Room: ${label}. Open room details` : 'Invite friends to focus together');
   }
 
-  createStoneListItem(stone, isTop, isBottom) {
-    const li = document.createElement('li');
-    li.className = 'stone-item';
-    li.setAttribute('data-stone-id', stone.id);
-    li.setAttribute('data-completed', stone.completed ? 'true' : 'false');
+  renderRoomDialog(state) {
+    const { room, profile } = state;
+    const inRoom = Boolean(room.roomId);
+    $('room-solo').hidden = inRoom;
+    $('room-active').hidden = !inRoom;
+    $('room-footer').hidden = !inRoom;
+    $('room-title').textContent = inRoom ? (room.isHost ? 'Your room' : 'Shared room') : 'Focus together';
 
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.className = 'stone-checkbox';
-    checkbox.checked = stone.completed;
-    checkbox.setAttribute('aria-label', `Mark "${stone.text}" as ${stone.completed ? 'incomplete' : 'complete'}`);
-    checkbox.addEventListener('change', () => {
-      store.toggleSteppingStone(stone.id);
-      peerSync.broadcast();
-    });
+    const err = $('room-error');
+    err.hidden = !room.error;
+    setText(err, room.error || '');
 
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'stone-text-input';
-    input.value = stone.text;
-    input.setAttribute('aria-label', `Edit task: ${stone.text}`);
+    if (!inRoom) return;
 
-    const commitEdit = () => {
-      const val = input.value.trim();
-      if (val && val !== stone.text) {
-        store.updateSteppingStone(stone.id, val);
-        peerSync.broadcast();
-      }
-    };
+    setText($('display-room-code'), roomCodeFromId(room.roomId));
+    const link = peerSync.inviteLink(room.roomId);
+    if ($('share-link-input').value !== link) $('share-link-input').value = link;
+    $('share-link-btn').hidden = !navigator.share;
 
-    input.addEventListener('change', commitEdit);
-    input.addEventListener('blur', commitEdit);
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') input.blur();
-    });
+    const count = Object.keys(room.peers).length + 1;
+    const statusText = {
+      connected: room.isHost
+        ? (count > 1 ? `Live · ${count} people here` : 'Live · waiting for friends to join')
+        : `Live · connected to ${room.hostName || 'host'}`,
+      connecting: room.isHost ? 'Opening room…' : 'Connecting to the room…',
+      disconnected: 'Not connected',
+    }[room.connectionStatus];
+    setText($('room-modal-status-text'), statusText);
+    setAttr($('room-modal-status'), 'data-status', room.connectionStatus);
+    $('retry-connection-btn').hidden = room.connectionStatus !== 'disconnected';
 
-    const actionsContainer = document.createElement('div');
-    actionsContainer.className = 'stone-actions';
+    const members = [
+      h('li', { class: 'room-member', text: `${profile.displayName} (you)`, attrs: { style: `--member-color:${profile.avatarColor}` } }),
+      ...Object.values(room.peers).map((p) => h('li', { class: 'room-member', text: p.isHost ? `${p.displayName} (host)` : p.displayName, attrs: { style: `--member-color:${p.avatarColor}` } })),
+    ];
+    $('room-members').replaceChildren(...members);
 
-    if (!stone.completed) {
-      const moveUpBtn = document.createElement('button');
-      moveUpBtn.type = 'button';
-      moveUpBtn.className = 'stone-move-btn';
-      moveUpBtn.innerHTML = '▲';
-      moveUpBtn.disabled = isTop;
-      moveUpBtn.setAttribute('aria-label', `Move "${stone.text}" up`);
-      moveUpBtn.addEventListener('click', () => {
-        store.moveSteppingStone(stone.id, 'up');
-        peerSync.broadcast();
-      });
-
-      const moveDownBtn = document.createElement('button');
-      moveDownBtn.type = 'button';
-      moveDownBtn.className = 'stone-move-btn';
-      moveDownBtn.innerHTML = '▼';
-      moveDownBtn.disabled = isBottom;
-      moveDownBtn.setAttribute('aria-label', `Move "${stone.text}" down`);
-      moveDownBtn.addEventListener('click', () => {
-        store.moveSteppingStone(stone.id, 'down');
-        peerSync.broadcast();
-      });
-
-      actionsContainer.appendChild(moveUpBtn);
-      actionsContainer.appendChild(moveDownBtn);
-    }
-
-    const deleteBtn = document.createElement('button');
-    deleteBtn.type = 'button';
-    deleteBtn.className = 'stone-delete-btn';
-    deleteBtn.setAttribute('aria-label', `Delete "${stone.text}"`);
-    deleteBtn.innerHTML = '&times;';
-    deleteBtn.addEventListener('click', () => {
-      store.deleteSteppingStone(stone.id);
-      peerSync.broadcast();
-    });
-
-    actionsContainer.appendChild(deleteBtn);
-
-    li.appendChild(checkbox);
-    li.appendChild(input);
-    li.appendChild(actionsContainer);
-    return li;
-  }
-
-  renderRoomStatus(room) {
-    const { roomId, connectionStatus, peers } = room;
-    const peerCount = Object.keys(peers).length + 1;
-    const cleanCode = peerSync.getCleanRoomCode();
-
-    if (this.roomBtn) {
-      this.roomBtn.setAttribute('data-status', connectionStatus);
-    }
-
-    if (!roomId) {
-      if (this.roomStatusIndicator) this.roomStatusIndicator.textContent = '👥 Solo';
-      if (this.roomModalStatus) this.roomModalStatus.textContent = 'Solo (No active room)';
-      if (this.retryConnectionBtn) this.retryConnectionBtn.style.display = 'none';
-      if (this.roomShareSection) this.roomShareSection.style.display = 'none';
-      if (this.leaveRoomBtn) this.leaveRoomBtn.style.display = 'none';
-      if (this.shareLinkInput) this.shareLinkInput.value = '';
-      return;
-    }
-
-    if (this.roomShareSection) this.roomShareSection.style.display = 'block';
-    if (this.leaveRoomBtn) this.leaveRoomBtn.style.display = 'inline-flex';
-    if (this.displayRoomCode) this.displayRoomCode.textContent = cleanCode || '—';
-
-    if (this.shareLinkInput) {
-      this.shareLinkInput.value = `${window.location.origin}${window.location.pathname}#room=${roomId}`;
-    }
-
-    if (connectionStatus === 'connecting') {
-      if (this.roomStatusIndicator) this.roomStatusIndicator.textContent = '🟡 Connecting...';
-      if (this.roomModalStatus) this.roomModalStatus.textContent = 'Connecting to squad mesh...';
-      if (this.retryConnectionBtn) this.retryConnectionBtn.style.display = 'none';
-    } else if (connectionStatus === 'connected') {
-      if (this.roomStatusIndicator) this.roomStatusIndicator.textContent = `🟢 ${peerCount} in Squad`;
-      if (this.roomModalStatus) this.roomModalStatus.textContent = `Connected (${peerCount} active)`;
-      if (this.retryConnectionBtn) this.retryConnectionBtn.style.display = 'none';
-    } else {
-      if (this.roomStatusIndicator) this.roomStatusIndicator.textContent = '🔴 Offline';
-      if (this.roomModalStatus) this.roomModalStatus.textContent = 'Disconnected';
-      if (this.retryConnectionBtn) this.retryConnectionBtn.style.display = 'inline-flex';
-    }
-  }
-
-  /**
-   * Non-destructive in-place DOM reconciliation for remote squad cards
-   * Prevents hover flickering on "Copy Steps" and retains accordion open states.
-   */
-  renderPeerGrid(peers) {
-    if (!this.peerSection || !this.peerGrid) return;
-    const peerEntries = Object.entries(peers);
-
-    if (peerEntries.length === 0) {
-      this.peerSection.style.display = 'none';
-      this.peerGrid.innerHTML = '';
-      return;
-    }
-
-    this.peerSection.style.display = 'flex';
-
-    // 1. Remove departed peers
-    const activePeerIds = new Set(Object.keys(peers));
-    const currentCards = this.peerGrid.querySelectorAll('[data-peer-card-id]');
-    currentCards.forEach((card) => {
-      const id = card.getAttribute('data-peer-card-id');
-      if (!activePeerIds.has(id)) {
-        card.remove();
-      }
-    });
-
-    // 2. Insert or update existing cards in-place
-    peerEntries.forEach(([peerId, data]) => {
-      let card = this.peerGrid.querySelector(`[data-peer-card-id="${peerId}"]`);
-      const totalStones = data.quest?.totalStones || 0;
-      const completedStones = data.quest?.completedStones || 0;
-      const progressPercent = totalStones > 0 ? Math.round((completedStones / totalStones) * 100) : 0;
-      const hasStonesToCopy = Array.isArray(data.quest?.stones) && data.quest.stones.length > 0;
-      const stones = Array.isArray(data.quest?.stones) ? data.quest.stones : [];
-
-      if (!card) {
-        card = document.createElement('article');
-        card.className = 'peer-card';
-        card.setAttribute('data-peer-card-id', peerId);
-        this.peerGrid.appendChild(card);
-      }
-
-      card.style.setProperty('--peer-accent', data.avatarColor || '#38bdf8');
-
-      // Preserve inspection drawer state across sync ticks
-      const existingDrawer = card.querySelector('.peer-stones-drawer');
-      const wasOpen = existingDrawer ? existingDrawer.hasAttribute('open') : false;
-
-      // Generate step preview markup
-      let previewItemsHtml = '';
-      if (stones.length > 0) {
-        const firstUncompleted = stones.find((s) => !s.completed);
-        previewItemsHtml = stones
-          .map((s) => {
-            const isActive = firstUncompleted && s.id === firstUncompleted.id;
-            const completedAttr = s.completed ? 'data-completed="true"' : '';
-            const activeAttr = isActive ? 'data-active="true"' : '';
-            const prefix = s.completed ? '✓' : (isActive ? '▶' : '•');
-            return `<li class="peer-preview-item" ${completedAttr} ${activeAttr}><span>${prefix}</span> ${this.escapeHtml(s.text)}</li>`;
-          })
-          .join('');
-      }
-
-      card.innerHTML = `
-        <div class="peer-card-header">
-          <span class="peer-name">${this.escapeHtml(data.displayName || 'Teammate')}</span>
-          <span class="peer-timer numeric-tabular">${this.formatTime(data.timer?.remainingMs || 0)}</span>
-        </div>
-        <div class="peer-quest">${this.escapeHtml(data.quest?.title || 'No Quest set')}</div>
-        <div class="peer-active-stone">${this.escapeHtml(data.quest?.activeStone || 'Idle')}</div>
-        
-        <div class="peer-progress-bar">
-          <div class="peer-progress-fill" style="width: ${progressPercent}%;"></div>
-        </div>
-
-        <div class="peer-footer-row">
-          <span class="peer-stats-badge">${completedStones}/${totalStones} (${progressPercent}%)</span>
-          ${hasStonesToCopy ? `<button type="button" class="peer-copy-btn" data-peer-id="${peerId}" title="Copy this checklist">Copy Steps</button>` : ''}
-        </div>
-
-        ${hasStonesToCopy ? `
-          <details class="peer-stones-drawer" ${wasOpen ? 'open' : ''}>
-            <summary class="peer-stones-summary">Inspect Process (${stones.length} steps)</summary>
-            <ul class="peer-stone-preview-list">
-              ${previewItemsHtml}
-            </ul>
-          </details>
-        ` : ''}
-      `;
-    });
-  }
-
-  evaluateA11yMilestones(remainingMs, status) {
-    if (status !== 'running') {
-      this.lastAnnouncedMinute = null;
-      return;
-    }
-
-    const currentMinute = Math.floor(remainingMs / 1000 / 60);
-
-    if (this.lastAnnouncedMinute !== currentMinute) {
-      if (remainingMs <= 60000 && remainingMs > 58000) {
-        this.announce('One minute remaining in session.');
-        this.lastAnnouncedMinute = currentMinute;
-      }
-    }
-  }
-
-  escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
-  openSettings() {
-    if (this.settingsDialog?.showModal) this.settingsDialog.showModal();
-  }
-
-  closeSettings() {
-    if (this.settingsDialog) this.settingsDialog.close();
+    $('room-host-link-row').hidden = !room.isHost;
+    $('room-guest-follow-row').hidden = room.isHost;
+    $('room-link-toggle').checked = room.linkTimers;
+    $('room-follow-toggle').checked = room.followHost;
   }
 
   openRoom() {
-    if (this.roomDialog?.showModal) this.roomDialog.showModal();
+    if (this.state) this.renderRoomDialog(this.state);
+    if (!this.el.roomDialog.open) this.el.roomDialog.showModal();
+    const focusTarget = this.state?.room.roomId ? $('copy-link-btn') : $('create-room-btn');
+    focusTarget?.focus();
   }
 
-  closeRoom() {
-    if (this.roomDialog) this.roomDialog.close();
+  /* ============================== settings ============================== */
+
+  buildPresets() {
+    this.el.presetRow.replaceChildren(...PRESETS.map((p) => h('button', {
+      type: 'button',
+      class: 'chip-btn',
+      dataset: { preset: p.id },
+      text: p.label,
+      title: `${p.sprint / 60} min sprints, ${p.shortRest / 60} min breaks, ${p.longRest / 60} min long rest`,
+    })));
+  }
+
+  applyPreset(id) {
+    const p = PRESETS.find((x) => x.id === id);
+    if (!p) return;
+    this.setDurationFields('sprint', p.sprint);
+    this.setDurationFields('short-rest', p.shortRest);
+    this.setDurationFields('long-rest', p.longRest);
+    this.syncPresetHighlight();
+  }
+
+  setDurationFields(prefix, seconds) {
+    $(`${prefix}-min`).value = Math.floor(seconds / 60);
+    $(`${prefix}-sec`).value = seconds % 60;
+  }
+
+  readDuration(prefix) {
+    const m = Math.max(0, parseFloat($(`${prefix}-min`).value) || 0);
+    const s = Math.max(0, parseFloat($(`${prefix}-sec`).value) || 0);
+    return Math.max(1, Math.round(m * 60 + s));
+  }
+
+  syncPresetHighlight() {
+    const sprint = this.readDuration('sprint');
+    const shortRest = this.readDuration('short-rest');
+    const longRest = this.readDuration('long-rest');
+    for (const btn of this.el.presetRow.children) {
+      const p = PRESETS.find((x) => x.id === btn.dataset.preset);
+      setAttr(btn, 'aria-pressed', p.sprint === sprint && p.shortRest === shortRest && p.longRest === longRest);
+    }
+  }
+
+  openSettings(config) {
+    this.setDurationFields('sprint', config.sprintDurationSeconds);
+    this.setDurationFields('short-rest', config.shortRestDurationSeconds);
+    this.setDurationFields('long-rest', config.longRestDurationSeconds);
+    $('rounds-before-long').value = config.roundsBeforeLongRest;
+    $('total-rounds').value = config.totalRounds;
+    $('auto-start-breaks').checked = config.autoStartBreaks;
+    $('auto-start-sprints').checked = config.autoStartSprints;
+    $('timer-direction-select').value = config.timerDirection;
+    $('sound-toggle').checked = config.soundEnabled;
+    $('sound-profile-select').value = config.soundProfile;
+    $('notify-toggle').checked = config.notificationsEnabled && 'Notification' in window && Notification.permission === 'granted';
+    $('notify-toggle').disabled = !('Notification' in window);
+    this.syncPresetHighlight();
+    this.el.settingsDialog.showModal();
+  }
+
+  readSettings() {
+    return {
+      sprintDurationSeconds: this.readDuration('sprint'),
+      shortRestDurationSeconds: this.readDuration('short-rest'),
+      longRestDurationSeconds: this.readDuration('long-rest'),
+      roundsBeforeLongRest: parseInt($('rounds-before-long').value, 10) || 4,
+      totalRounds: Math.max(0, parseInt($('total-rounds').value, 10) || 0),
+      autoStartBreaks: $('auto-start-breaks').checked,
+      autoStartSprints: $('auto-start-sprints').checked,
+      timerDirection: $('timer-direction-select').value,
+      soundEnabled: $('sound-toggle').checked,
+      soundProfile: $('sound-profile-select').value,
+      notificationsEnabled: $('notify-toggle').checked,
+    };
   }
 }
 
